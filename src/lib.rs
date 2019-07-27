@@ -6,6 +6,7 @@ extern crate url;
 extern crate open;
 extern crate bincode;
 extern crate serde;
+extern crate time;
 
 pub mod local_client {
     use std::thread;
@@ -18,9 +19,10 @@ pub mod local_client {
     use oauth2::{Config, Token, TokenError};
     use serde::{Serialize, Deserialize};
 
-    #[derive(Serialize, Deserialize)]
+    #[derive(Clone, Debug, Serialize, Deserialize)]
     pub struct TokenStore {
-        token: Option<Token>
+        token: Option<Token>,
+        timestamp: i64
     }
 
     pub struct OAuth2Client {
@@ -48,7 +50,8 @@ pub mod local_client {
                 ok_message: String::from("I received access code from remote auth service. You can now close this window :)"),
                 cache_path: PathBuf::default(),
                 token_store: TokenStore {
-                    token: None
+                    token: None,
+                    timestamp: 0
                 },
                 empty_cache: false
             }
@@ -98,15 +101,28 @@ pub mod local_client {
                 // read token data from data file
                 let f = std::fs::File::open(self.cache_path).unwrap();
                 self.token_store = bincode::deserialize_from(f).unwrap();
-                // since we read the token from cache refresh it
-                let token_result = self.oauth_config.exchange_refresh_token(
-                    self.token_store.token.unwrap().refresh_token.unwrap());
-                if token_result.is_err() {
-                    return token_result;
+
+                // calculate timestamp for expiry time for the old token
+                debug!("{:?}", self.token_store);
+                let expires_in: i64 = self.token_store.clone().token.unwrap().expires_in.unwrap().into();
+                let valid_until: i64 = self.token_store.timestamp + expires_in;
+                let now: i64 = time::now_utc().to_timespec().sec;
+                if valid_until <= now {
+                    debug!("Cached token has expired. Refreshing it.");
+                    // refresh the token since it has expired
+                    // since we read the token from cache refresh it
+                    let token_result = self.oauth_config.exchange_refresh_token(
+                        self.token_store.token.unwrap().refresh_token.unwrap());
+                    if token_result.is_err() {
+                        return token_result;
+                    } else {
+                        self.token_store.token = Some(token_result.unwrap());
+                    }
                 } else {
-                    self.token_store.token = Some(token_result.unwrap());
+                    debug!("Cached token is still valid.");
                 }
             } else {
+                debug!("No token cache found. Requesting a new token.");
                 let (tx, rx): (Sender<String>, Receiver<String>) = mpsc::channel();
                 let (tx1, rx1): (Sender<bool>, Receiver<bool>) = mpsc::channel();
 
@@ -156,13 +172,16 @@ pub mod local_client {
                 }
 
                 let auth_code = rx.recv().unwrap();
+                debug!("auth code: {}", auth_code);
                 tx1.send(true).unwrap();
                 let token_result = self.oauth_config.exchange_code(auth_code);
+                debug!("token_result: {:?}", token_result);
                 if token_result.is_err() {
                     // if token_result is an err we did not succesfully fetch the token therefore return the error
                     return token_result
                 } else {
                     self.token_store.token = Some(token_result.unwrap());
+                    self.token_store.timestamp = time::now_utc().to_timespec().sec;
                     if self.cache_path.is_file() {
                         // we now have the token, cache it.
                         let mut f = std::fs::File::create(self.cache_path).unwrap();
